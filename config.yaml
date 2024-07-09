@@ -1,0 +1,148 @@
+user: ryan
+target_subvol: "@"
+profile: "default/linux/amd64/23.0/desktop/gnome"
+dm: "gdm"
+shell: /bin/zsh
+binaries: true
+nvidia: true
+meta:
+  description: "Configuration for Gentoo @base Bootstrap"
+  scripts:
+    build: build_system.py
+  date_created: 2024-07-07
+  date_modified: 2024-07-07
+
+packages:
+    # System
+  - app-admin/doas
+  - app-admin/sudo
+    # Need nano or vi for visudo
+  - app-editors/nano
+  - sys-boot/efibootmgr
+  - sys-fs/cryptsetup
+  - sys-kernel/dracut
+  - sys-kernel/gentoo-kernel-bin
+  - sys-kernel/linux-firmware
+  - sys-process/cronie
+  - x11-misc/xdg-user-dirs
+
+    # Gnome
+  - gnome-base/gdm
+  - gnome-base/gnome-light
+  - x11-terms/guake
+
+  - gui-libs/display-manager-init
+  -
+    # Filesystem
+  - app-arch/zstd
+  - sys-fs/btrfs-progs
+  - sys-fs/dosfstools
+  - sys-fs/zfs
+
+
+    # Fonts
+  - x11-base/xorg-fonts
+  - media-fonts/dejavu
+  - media-fonts/fira-sans
+  - media-fonts/fira-code
+  - media-fonts/fira-mono
+  - media-fonts/jetbrains-mono
+
+    # Emoji's etc.
+  - media-fonts/noto
+  - media-fonts/noto-emoji
+  - media-fonts/fontawesome
+
+    # I needed this for some Rust stuff
+  - media-libs/fontconfig
+
+    # Networking
+  - net-misc/dhcpcd
+  - net-wireless/iwd
+  - net-dns/bind-tools
+  - net-vpn/wireguard-tools
+  - net-vpn/openvpn
+  - net-misc/unison
+  - net-vpn/i2pd
+
+    # Tor
+  - app-eselect/eselect-repository
+  - www-client/torbrowser-launcher
+
+    # Editors
+  - dev-util/ctags
+  - net-libs/nodejs
+
+
+    # Desktop
+  - www-client/firefox-bin
+  - x11-wm/i3
+  - media-gfx/feh
+  - x11-apps/xrandr
+  - x11-terms/alacritty
+  - x11-misc/i3status
+  - x11-misc/i3lock
+  - app-editors/neovim
+  - app-misc/tmux
+  - app-text/zathura
+  - app-text/zathura-djvu
+  - app-text/zathura-pdf-mupdf
+  - app-text/zathura-ps
+
+    # Hyprland
+  - kitty
+  - swaybg
+  - waybar
+  - gui-wm/hyprland
+  - wofi
+  - grim
+  - slurp
+
+
+    # utilities
+  - sys-process/htop
+  - sys-apps/busybox
+  - dev-vcs/git
+  - dev-vcs/git-lfs
+  - dev-vcs/bfg
+  - dev-util/rustup
+  - dev-lang/go
+  - app-misc/neofetch
+  - app-text/pandoc-bin
+
+    # Shells
+  - app-shells/fish
+  - app-shells/zsh
+  - app-shells/dash
+  - app-shells/fzf
+  - app-shells/starship
+  - app-misc/ranger
+  - x11-terms/wezterm
+
+    # Clipboards
+  - gui-apps/wl-clipboard
+  - x11-misc/xclip
+  - x11-misc/xsel
+  - xsel
+
+    # containers
+  - x11-apps/xeyes
+  - app-containers/distrobox
+  - app-containers/docker
+  - app-containers/docker-cli
+  - app-containers/docker-compose
+  - app-containers/podman
+
+
+    # Gentoo tools
+  - app-portage/eix
+  - app-portage/gentoolkit
+  - app-portage/pfl
+  - app-portage/emlop
+  - sys-apps/flatpak
+  - sys-fs/fuse:0
+  - sys-apps/arch-chroot
+
+    # Qutebrowser
+  - net-misc/socat
+

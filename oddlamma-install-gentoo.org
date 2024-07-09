@@ -1,0 +1,1206 @@
+#+title: Oddlamma Install Gentoo
+
+* Introduction
+** Introduction
+:PROPERTIES:
+:CUSTOM_ID: introduction
+:END:
+This page is unstructured thoughts, it requires a lot of refactoring.
+
+*** Primary Insights
+:PROPERTIES:
+:CUSTOM_ID: primary_insights
+:END:
+1. Developing an =@base= snapshot and tarball for a quicker deployment
+   of Gentoo
+2. Bootstrapping =@base= to =@current= with an =init.sh= to promote
+   reproducability and help debugging
+3. Regularly rolling back to =@base= to enforce stability and
+   reproducability
+4. Exclusively updating by first rolling back to =@current= to enforce a
+   /practically immutable/ system to promote stability
+
+These Insights, which read like tasks, are possible because all dev work
+can be migrated into Distrobox, it's much easier to debug =Dockerfiles=
+on a functioning system than install scripts on one you're trying to
+bootstrap. What's worse is trying to debug a broken install on a system
+that is in an uncertain and unmaintained state.
+
+*** Secondary Insights
+:PROPERTIES:
+:CUSTOM_ID: secondary_insights
+:END:
+Secondary insights in the form of Notes
+
+1. EFIBootmgr
+2. ZFSBootmenu
+3. Kernel Parameters
+
+*** Learning Outcomes
+:PROPERTIES:
+:CUSTOM_ID: learning_outcomes
+:END:
+Some things learned through this escapade:
+
+1. ZFS vs BTRFS
+   1. The features of btrfs like non-linear snapshots, reflink, live
+      rollback [fn:1]
+   2. BTRFS is requires for =--userns= and Native Overlay with Podman
+      (i.e. if using distrobox, ZFS requires setting fuse in the
+      =~/.config/containers/storage.conf=
+      1. I'm not sure of the performance impact of this
+2. Podman
+   1. Learned how to check for Native overlay
+
+[fn:1] ZFS allows this too, both systems require a restart. However, ZFS
+       ocassionally complains about things being mounted or busy. ZFS
+       always complains about root being mounted when doing
+       =zfs send rpool/ROOT/gentoo | zfs recv rpool/ROOT/gentoo/backup=,
+       that command is necessary though because =gentoo= can't be rolled
+       back to a snapshot if =backup= is a mere clone (that would depend
+       on those snapshots).
+
+* Boot Arch
+#+begin_src bash
+pacman -Syu archlinux-keyring git rhash
+git clone 'https://github.com/oddlama/gentoo-install'
+./configure
+# btrfs centric, /dev/nvme0n1, openrc base profile
+GENTOO_INSTALL_ENCRYPTION_KEY='xxxxx' ./install
+#+end_src
+
+I found it useful to mount a text file for notetaking in there
+
+#+begin_src bash
+pacman -S rsync neovim
+# install npm for neovim
+pacman -S nodejs npm
+rsync -avh ryan@vidar:~/.config/nvim ~/.config/
+nvim
+# Must mount directory, not file, avoid ~ after : and don't mount over ~
+mkdir ~/Notes
+sshfs ryan@vidar:/Notes/slipbox/ ~/Notes
+#+end_src
+* Post Install Script
+
+
+#+begin_src bash
+sudo ./install --chroot /tmp/gentoo-install/root/
+# Inside Gentoo
+# Install things to make configuration easier
+emerge -g neovim ctags iwd fish tmux dosfstools pfl gentoolkit eix btrfs-progs cronie zsh doas xdg-user-dirs
+# Node is needed for neovim plugins (nodejs includes npm)
+emerge -g nodejs
+printf 'permit nopass :wheel\n' > /etc/doas.conf
+# Add a user
+useradd -m -G users,wheel,audio,video,cron -s /bin/zsh ryan
+passwd ryan
+su ryan
+xdg-user-dirs-update
+mkdir -p ~/.local/share
+# Copy in the neovim config
+rc-update add iwd default
+eix-update
+#+end_src
+
+
+
+Outside the install:
+#+begin_src bash
+# Copy in the neovim config
+RD=/tmp/root/gentoo-install/root/home/ryan
+cp -ar ~/.config/nvim ${RD}/.config/
+cp -ar ~/.local/share/nvim ${RD}/.local/share/
+
+sudo ./install --chroot /tmp/gentoo-install/root/
+# Inside Gentoo
+chown -R ryan:ryan ~/.local/share/nvim
+chown -R ryan:ryan ~/.config/nvim
+nvim
+#+end_src
+
+** Ensure the make.conf is not native
+For now ensure that:
+
+#+begin_src bash
+# /etc/portage/make.conf
+CFLAGS="O2 -pipe"
+#+end_src
+
+Later these can be made ~-march=native~ by running =emerge -e @world= and then installing packages over the top of base. However it can't reliably be undone, meaning it is not possible to tarball the install and move it between machines.
+* Reboot
+At this stage you're good to reboot, make sure tmux and neovim work and that iwd is installed and enabled
+* Label the partitions:
+
+#+begin_src bash
+fatlabel /dev/nvme0n1p1 BOOT
+
+swaplabel -L SWAP /dev/nvme0n1p2
+
+cryptsetup config /dev/nvme0n1p3 --label CRYPT
+btrfs filesystem label /tmp/gentoo-install/root Butter
+
+# Confirm
+blkid -o list
+#+end_src
+
+** Modify fstab
+
+Edit the fstab and ensure that it uses labels and that btrfs has compression, also I like @ not /root e.g.:
+
+#+begin_example
+# old
+# UUID=xxxx...    /    btrfs    defaults,noatime,compress=zstd,subvol=/root    0 1
+# New, use label and name subvol @
+LABEL=Butter      /    btrfs    defaults,noatime,compress=zstd,subvol=/@       0 1
+#+end_example
+* Default Subvolume
+oddlama modifies the partition to have a default subvolume, this makes mounting the actual partition confusing, I disable it and specify the subvolumes manually to avoid confusion. This allows me to have efibootmgr entries of earlier snapshots that I can use for recovery.
+
+#+begin_src bash
+# Allow mounting subvolume drive
+sudo btrfs subvolume set-default 5 / # /tmp/gentoo-install/root
+#+end_src
+
+Now it is necessary to take the efibootmgr entry which has a line like:
+
+#+begin_example
+'initrd=\initramfs.img'"rd.vconsole.keymaps=us rd.luks.uuid=xxxxxxxx-xxxx root=LABEL=Butter"
+#+end_example
+
+Specifically:
+#+begin_example
+"rd.vconsole.keymaps=us rd.luks.uuid=xxxxxxxx-xxxx root=LABEL=Butter"
+#+end_example
+
+Modify it to include the name of the subvolume:
+
+#+begin_example
+"rd.vconsole.keymaps=us rd.luks.uuid=xxxxxxxx-xxxx root=LABEL=Butter rootflags=subvol=root"
+#+end_example
+
+Now generate the efibootmgr record:
+
+#+begin_src bash
+sh /boot/efi/efiboomgr_add_entry.sh
+#+end_src
+
+Later we will clean up the entries and rename root to @, but reboot and make sure this worked, otherwise it's a pain later.
+* Create a Bootable Maintenance Subvolume
+
+Create a spare subvolume and rename the =/root= to =@= [fn:1]:
+
+#+begin_src bash
+mkdir /tmp/Butter
+mount LABEL=Butter /tmp/Butter
+cd /tmp/Butter
+
+btrfs subvolume snapshot root @
+btrfs subvolume snapshot @ @base
+
+# Delete root later
+echo 'Delete ./root when system boots' >> TODO.txt
+#+end_src
+
+In the fstab of each subvolume change the name of the subvol to match [fn:5]:
+
+#+begin_src bash
+# sed 's!subvol=/root!subvol=/@' <  @/etc/fstab
+  sed 's!subvol=/root!subvol=/@' -i @/etc/fstab
+
+for s in @ @base; do
+    btrfs subvolume snapshot root ${s}
+    sed "s!subvol=/root!subvol=/${s}" -i ${s}/etc/fstab
+    cat ${s}/etc/fstab
+done
+#+end_src
+
+don't forget this step, the system will continue to boot and put the subvolume on root, however the fstab will list a different subvolume.
+
+#+begin_src
+# if kernel has @_k and fstab has @_f
+btrfs subvolume show /
+
+# Output
+# @_k
+#+end_src
+
+If you were to run:
+
+#+begin_src bash
+doas su
+# this may or may not work
+umount -l / && mount -av
+
+# if kernel has @_k and fstab has @_f
+btrfs subvolume show /
+
+# Output
+# @_f
+#+end_src
+
+A recipe for confusion! In summary, the following should always match:
+
+#+begin_src bash
+# The subvolume mounted on root in /etc/fstab
+cat /etc/fstab |\
+    grep -v '^#' |\
+    grep ' / '   |\
+    grep -o 'subvol=[^,]*'
+
+# The subvolume on root
+btrfs subvol show /
+#+end_src
+
+So remember, when making a subvolume:
+
+
+1. Leave the fstab if that subvolume will be moved back to =@= to make it bootable
+2. Modify the fstab if that subvolume needs to be bootable:
+   1. Modify fstab in subvolume
+   2. Add efi entry with ~rootflags=subvol=${svname}~
+* Additional EFI entries
+Create a fallback efibootmgr entry by changing =/boot/efi/efibootmgr_add_entry.sh= to add the additional fallback subvolume and change the =UUID= to =LABEL=. There should be a script there, copy the first line and modify it to have the correct ~subvol=${svname}~ and to use ~root=LABEL=Butter~. The script should look something like this for example [fn:2]:
+
+#+begin_src bash
+t=root # the name the luks container will have at /dev/mapper/, e.g. if t=foo then /dev/mapper/$foo
+efibootmgr \
+	--verbose \
+	--create \
+	--disk "/dev/nvme0n1" \
+	--part "1" \
+	--label "gentoo (@)" \
+	--loader '\vmlinuz.efi' \
+	--unicode 'initrd=\initramfs.img'" rd.vconsole.keymap=us rd.luks.name=xxxxxxxxx=${t} root=LABEL=ButterVault rootflags=subvol=@"
+#+end_src
+
+delete all efibootmgr entries and re-run the script
+
+#+begin_src bash
+efibootmgr -v | awk '{print $1 $2}'
+
+# Say we want to remove Boot0001* Gentoo
+# -b selects ID
+# -B removes
+efibootmgr -b  00001 -B
+#+end_src
+
+Reboot into =@= and ensure that the booted subvolume aligns with that listed in =cat /etc/fstab=.
+
+#+begin_src sh
+# If another subvol isn't mounted over the top,
+# this should work
+btrfs subvolume show /
+findmnt
+#+end_src
+* Tarball it
+This system now represents a =base=, ensure that the =make.conf= is **not** ~-march=native! and tarball it so it can be extracted for a restore or moved between machines for a quicker install of Gentoo (we will use snapshots to keep this base tarball mainted):
+
+#+begin_src sh
+mount LABEL=Butter /mnt/Butter
+mkdir gentoo
+btrfs subvolume snapshot    @ gentoo/@base
+btrfs subvolume snapshot -r @ gentoo/@base_ro
+cd gentoo
+
+# Create
+bsdtar --acls --xattrs --preserve-permissions -cvaf ../root-backup_base.tar.gz .
+#+end_src
+
+This snapshot can later be unpacked in the same way as the Gentoo tarball:
+
+#+begin_src sh
+cd /
+bsdtar --acls --xattrs  --numeric-owner -xpzf ${backupfile}
+#+end_src
+
+* Moving this Base Image Between Machines
+I then tarballed this and moved it to my ZFS laptop:
+
+1. Tarball it
+2. Unpack on laptop in zfs dataset
+3. Install zfs
+4. =emerge @module-rebuild=
+5. copy in new kernel and regegenerate initramfs (ensure that zfs module is there!)
+6. Add an EFIbootmgr entry that points to the kernel, initramfs and the =root=ZFS=datasetname=
+7. Optionally change the =COMMON_FLAGS= to include =" ... -march=native ..."= and =emerge -e @world=
+   1. Note that this is a one way street, removing that flag and emerging with empty tree still leaves some native stuff over, this means you can't tarball the whole system, the =buildpkg= feature or =quickpkg= is /probably/ fine, but you cannot tarball the system, I tried.
+
+This worked perfectly fine and the machine booted.
+* Adjusting make.conf
+Check how many cores the system has:
+
+#+begin_src sh
+# note that BSDs including mac have sysctl -n hw.ncpu
+grep -c '^processor' /proc/cpuinfo 2>/dev/null ||\
+    lscpu
+#+end_src
+
+#+RESULTS:
+: 12
+
+Adjust the =/etc/portage/make.conf= accordingly:
+
+#+begin_src sh
+# Consider adding march native if this system won't be shared among devices or
+# act as a bin host
+COMMON_FLAGS="-O2 -pipe"
+COMMON_FLAGS="-O2 -pipe -march=native"
+
+
+# default to binary packages
+FEATURES="getbinpkg"
+# After the system is stable, ensure binaries are signed correctly (enable this
+# after, otherwise the keyring can get confused moving between machines)
+FEATURES="${FEATURES} binpkg-request-signature"
+
+# Use all cores while compilingw
+MAKEOPTS="--jobs 12 --load 13"
+
+# Consider caching built packages
+FEATURES="${FEATURES} buildpkg"
+#+end_src
+
+
+** ~-march=native~
+Install all the packages as generic =x86= first, that way an extractable and portable tarball can be generated for backup purposes. Besides, at this stage, building off binaries will involve less time nursing the machine.
+
+After the machine is up and running, snapshot =@= into =@current=, =emerge -e
+@world= and then make another snapshot called =@current_native=. As a SOP:
+
++ =@base= and =@current= will always be non-native and have a tarball in case
+  they need to be redistributed during an emergency.
++ =@base= and =@current= will be regularly updated via chroot.
++ =@= will regularly be rolled back to =@current= or =@current_native= to ensure a practically immutable root
+  + All software and dev tools should be in distrobox/toolbx, flatpak or chroots with bubblewrap
+  + Note: =stat @current_ro | grep Birth= will show the last time the subvolume was updated.
++ =@current= will regularly be bootstrapped from =@base= with an =init.sh=
+  + If most software is in distrobox, this is acheivable
+    + Much easier to debug Dockerfiles than root installs
+      + Exceptions might include PyTorch for reasons of performance when training models.
+
+* Implement snapshot immutability stuff
+Here I consider how to get some degree of immutability of the system to promote stability and reproducibility.
+** Policy
+*** Subvolume layout
++ =@=
+  + The current Default File system
++ =/${distro}=
+  + =/@=
+    + The current system
+  + =/@base=
+    + The base system after a fresh install (In the case of Gentoo/Arch also fish, tmux etc.)
+  + =/@current=
+    + The base system after running =init.sh= to bootstrap the system to a usable state
+  + =/@current_native=
+    + The current system after running =emerge -e @world= with the ~-march=native~ flag.
+  + =/@backup=
+    + Every time =@= is changed it is moved onto =/@backup=.
+*** Workflow
+**** Updating (Daily)
+Updating involves reverting back to =@current=, updating that, and then snapshotting it.
+***** Recipe
+1. Backup =@=
+2. Roll =@= back to =@current=
+3. Chroot inside
+4. Update
+5. Snapshot
+   1. As it's only an update, we assume it doesn't compromise system stability
+   2. The point is, we don't rely on software interacting well, this is relegated to containers
+   3. This may be expanded to include a directory
+6. Tarball
+
+***** Example
+#+begin_src sh
+# 1.
+btrfs subvolume delete @backup
+# 2.
+btrfs subvolume snapshot @current_ro @
+# 3.
+mkdir /tmp/chroot
+mount LABEL=Butter -o subvol=@ /tmp/chroot
+arch-chroot /tmp/chroot
+# 4.
+emerge --sync
+emerge -guND @world
+# 5.
+btrfs subvolume snapshot delete @current
+btrfs subvolume snapshot delete @current_ro
+# 6.
+cd @current
+bsdtar --acls --xattrs --preserve-permissions -cvaf ../root-backup_base.tar.gz .
+#+end_src
+
+#+begin_src bash sh
+btrfs subvol delete @backup
+btrfs subvol snap   @ @backup
+#+end_src
+#+begin_src sh
+#+end_src
+#+begin_src sh
+#+end_src
+**** Bootstrapping (Weekly)
+Bootstrapping involves updating the Base image and using it to build =@current=. This ensures that the system is reproducable, stable and static.
+***** Recipe
+1. Backup =@=
+2. Roll back to =@base=
+3. Chroot inside
+4. Update Base
+   1. Snapshot
+   2. Tarball
+5. Bootstrap with init.sh
+   1. Snapshot
+   2. Tarball
+***** Example
+#+begin_src sh
+make_tar() {
+    cd /mnt/Butter/${1}
+    dir=$(basename $(pwd))
+    bsdtar --acls --xattrs --preserve-permissions -cvaf ../root-backup_${dir}.tar.gz .
+}
+make_snap() {
+    cd /mnt/Butter/${1}
+    btrfs subvolume delete      ${1} ${1}_ro
+    btrfs subvolume snapshot    @    ${1}
+    btrfs subvolume snapshot -r @    ${1}_ro
+}
+# 1.
+btrfs subvolume delete   @backup
+# 2.
+btrfs subvolume snapshot @base @
+# 3.
+mkdir /tmp/chroot
+mount LABEL=Butter -o subvol=@ /tmp/chroot
+arch-chroot /tmp/chroot
+# 4.
+emerge --sync
+emerge -guND @world
+
+make_snap gentoo/@base
+make_tar  gentoo/@base_ro
+# 5.
+cd /home/ryan/Sync/Projects/2024/static-os/zfs-gentoo
+./init.sh
+
+make_snap gentoo/@base
+make_tar  gentoo/@base_ro
+#+end_src
+** Notes
+*** Kernels
+Some motherboards require =efibootmgr= entries with an identical kernel to have that kernel copied into another directory for the entry to persist. This is important because we are using the same kernel with different kernel parameters to boot different subvolumes. Create a directory structure under =/boot/efi= that mirrors =/mnt/Butter=
+*** FSTab
+One can make =efibootmgr= entries with kernel parameters for root as a subvolume that don't match the entry in the =fstab=, the kernel parameter takes precedence (confirm this with =findmnt; cat /etc/fstab=), I don't know what the ramifications of this are, for long term stability, keep a subvolume with a modified fstab on hand as the /BTRFS Maintenance/ boot option (on top of Gentoo, Fedora, Void etc.).
+* Troubleshooting
+** initramfs emergency shell
+You can mount manually [fn:3]:
+
+#+begin_src bash
+mkdir -p /mnt/root
+mount LABEL=Butter -o subvol=@ /mnt/root
+exec switch_root /mnt/root /sbin/init
+#+end_src
+- You cannot use a LUKS label to unlock the volume in the boot process; use the UUID for `rd.luks.uuid`.
+- You can set a file system label within the LUKS container for mounting purposes after it's unlocked.
+- If data migration and persistent labelling is the goal, focus on file system labels after the LUKS volume is opened, not the LUKS label itself.
+- Use `cryptsetup reencrypt` if you want to change the UUID after copying a LUKS partition for differentiation or `cryptsetup luksUUID` for a more straightforward UUID change. This step is especially important to prevent UUID conflicts if both the original and copied partitions will be on the same system.
+
+
+- **LUKS Encryption**: LUKS encryption is applied at the block device level, not at the file-based level. The encryption encapsulates the entire partition, and a key is required to decrypt and mount the content of the partition.
+
+To copy it you would have to use `dd` which would persist the UUID anyway (often better to avoid `dd` and get data on a fresh file system, btrfs can age poorly and updates to the FS standard may need a reformat to apply)
+Where can I find the authorative list of all =rd.luks.= parameters?
+
+#+begin_src sh
+man dracut
+man dracut.cmdline
+#+end_src
+
+You can read here:
+
+https://github.com/dracutdevs/dracut/blob/master/man/dracut.cmdline.7.asc
+
+It seems there is no support for anything but uuid. it may scan the
+crypttab
+
+can disable other things to speed up boot
+[^https://github.com/dracutdevs/dracut/blob/master/man/dracut.usage.asc]
+
+=rd.lvm=0 rd.md=0 rd.dm=0=
+
+The documentation suggests [fn:4]
+it may scan crypttab if allowed. This would likely slow down boot.
+Typically crypttab runs off root so it's only good for secondary disks.
+
+I could specify a dracut command to give /dev/mapper/ whatever name I
+like
+
+#+begin_example
+UUID=xxxxxxxxxxx
+dmname=unlocked_root
+
+rd.luks.uuid=${UUID}
+rd.luks.name=${UUID}=${dmname}
+#+end_example
+
+Not much need though, because the unlocked_root has it's own label, so
+these would be the same anyway:
+
+#+begin_example
+# use dev/mapper/name
+mount /dev/mapper/${dmname}       /mnt
+# use label
+mount /dev/disk/by-laben/${LABEL} /mnt
+mount LABEL=${LABEL}              /mnt
+#+end_example
+* Appendix
+** Miscellaneous Notes
+These were notes collected when I went through and re-installed Gentoo on my Laptop =frame=, on =pixie=, on =silv= and intended to install it on Vidar.
+*** Notes on EFIBootmgr
+an EFIbootmgr command may look something like this:
+
+#+begin_src bash
+efibootmgr --verbose --create --disk "/dev/nvme0n1" --part "1" --label "gentoo" --loader '\vmlinuz.efi' --unicode 'initrd=\initramfs.img'" rd.vconsole.keymap=us"
+#+end_src
+
+This does not have a ~root=~ parameter specifid, this means it's relying on the zfs =bootfs= parameter:
+
+#+begin_src bash
+zfs list
+#+end_src
+
+#+begin_example
+NAME                 USED  AVAIL  REFER  MOUNTPOINT
+rpool                477G   407G   192K  none
+rpool/ROOT           476G   407G   192K  none
+rpool/ROOT/default   476G   407G   376G  /
+#+end_example
+
+#+begin_src bash
+ zpool get bootfs rpool
+#+end_src
+
+#+begin_example
+NAME   PROPERTY  VALUE               SOURCE
+rpool  bootfs    rpool/ROOT/default  local
+#+end_example
+
+ZFS can be specified explicitely and most other filesystems require the =root= parameter to be set, like so:
+
+#+begin_src bash
+# For btrfs (or ext4 / xfs)
+root_par="root=LABEL=Butter"
+
+# For ZFS
+root_par="root=ZFS=rpool/ROOT/default"
+
+kern_par="rd.vconsole.keymaps=us ${root_par}"
+unicode='initrd=\initramfs.img'"${kern_par}"
+
+efibootmgr --verbose --create --disk "/dev/nvme0n1" --part "1" --label "gentoo" --loader '\vmlinuz.efi' --unicode ${unicode}
+#+end_src
+
+However, if this was =btrfs=, there is no subvolume specified here, this is because it's relying on the default btrfs subvolume:
+
+#+begin_src bash
+# check the default subvolume
+sudo btrfs subvolume get-default /
+
+# Set the default as the actual partition (i.e. remove it)
+id=5
+sudo btrfs subvolume set-default ${id}
+#+end_src
+
+
+
+To specify a specific subvolume:
+
+#+begin_src bash
+root_par="root=LABEL=Butter"
+subv_par="rootflags=subvol=@"
+
+kern_par="rd.vconsole.keymaps=us ${root_par} ${subv_par}"
+unicode='initrd=\initramfs.img'"${kern_par}"
+
+efibootmgr --verbose --create --disk "/dev/nvme0n1" --part "1" --label "gentoo" --loader '\vmlinuz.efi' --unicode ${unicode}
+#+end_src
+
+If the partition is under a luks container (i.e. subvol ⊂ partition ⊂ luks) [fn:6]:
+
+#+begin_src bash
+luks_par="rd.luks.uuid=xxxxxxxx-xxxx"
+root_par="root=LABEL=Butter"
+subv_par="rootflags=subvol=@"
+
+kern_par="rd.vconsole.keymaps=us ${luks_par} ${root_par} ${subv_par}"
+unicode='initrd=\initramfs.img'"${kern_par}"
+
+efibootmgr --verbose --create --disk "/dev/nvme0n1" --part "1" --label "gentoo" --loader '\vmlinuz.efi' --unicode ${unicode}
+#+end_src
+*** Notes on ZFS
+After unpacking the image onto a zfs dataset:
+
+#+begin_src bash
+zfs list
+#+end_src
+
+#+begin_example
+NAME                 USED  AVAIL  REFER  MOUNTPOINT
+rpool                477G   407G   192K  none
+rpool/ROOT           476G   407G   192K  none
+rpool/ROOT/default   476G   407G   376G  /
+#+end_example
+
+Our intention is to have a layout like this:
+
+#+begin_example
+NAME
+rpool
+rpool/ROOT
+rpool/ROOT/base               # BOOTABLE # The base system we started with,
+                                         # used for maintenance of datasets when
+                                         # we can't boot
+rpool/ROOT/gentoo@base       #           # A snapshot of base to roll back too
+rpool/ROOT/gentoo@current    #           # A snapshot of our current system
+rpool/ROOT/gentoo            # BOOTABLE  # The current system
+rpool/ROOT/backup            # BOOTABLE  # A backup of the current system, created before any updates etc.
+#+end_example
+
+The idea is to run =/gentoo= day to day, before running an update or installing a new package, =snapshot=, =clone= and =promote= the =/gentoo= dataset to =/backup= then =rollback= =gentoo= to either:
+
+1. =@current=
+   1. Run the update
+2. =@base=
+   1. Run the update
+   2. Run an =init.sh= to install everything
+
+If something goes wrong both =/base= and =/backup= should have EFIBootmgr entries so this will come at no cost to uptime.
+
+This workflow ensures the system is always in reproducable state and the the system is practically immutable, let's call it a static OS. This offers the advantages of an immutable distro with the flexibility to edit =/etc/resolv.conf=.
+
+To acheive this:
+
+#+begin_src bash
+# Create a snapshot of the base system
+zfs snapshot rpool/ROOT/default@base
+
+# Create a bootable base system for maintenance
+zfs clone rpool/ROOT/default@base rpool/ROOT/base
+zfs promote rpool/ROOT/base
+
+# Create a snapshot for the current system we are using
+# (base and current are the same right now)
+zfs clone rpool/ROOT/default@base rpool/ROOT/base
+
+# Create a backup system that we regularly move our current to
+zfs clone rpool/ROOT/default@current rpool/ROOT/backup
+zfs promote rpool/ROOT/base
+#+end_src
+
+Now we need to make the maintenance and current datasets bootable:
+
+#+begin_src bash
+make_efi_entry() {
+    root_par="root=ZFS=rpool/ROOT/${1}"
+    kern_par="rd.vconsole.keymaps=us ${root_par} "
+    unicode='initrd=\initramfs.img'"${kern_par}"
+
+    efibootmgr --verbose --create --disk "/dev/nvme0n1" --part "1" --label "gentoo (/${1})" --loader '\vmlinuz.efi' --unicode ${unicode}
+}
+
+make_efi_entry base
+make_efi_entry backup
+#+end_src
+*** BTRFS
+Mount the partition and it should look something like this:
+
+#+begin_src bash
+mount LABEL=Butter /mnt
+ls /mnt
+#+end_src
+
+#+begin_example
+@
+#+end_example
+
+Our intention is to have a layout like this:
+
+#+begin_example
+gentoo/@base         # BOOTABLE  # The base system we started with,
+                                 # used for maintenance of datasets when
+                                 # we can't boot
+gentoo/@base_ro      #           # A snapshot of base to roll back too
+gentoo/@current_ro   #           # A snapshot of our current system
+gentoo/@current      # BOOTABLE  # The current system
+gentoo/@backup       # BOOTABLE  # A backup of the current system, created before any updates etc.
+gentoo/@backup_ro    #           # Just in case a wild =chmod= or =chown= attacks
+#+end_example
+
+The idea is much the same as zfs above, before running an update or installing a new package, move =@current= into =@backup= and then either:
+
+1. =btrfs subv snap @current_ro @current=
+   1. Run the update
+1. =btrfs subv snap @base_ro   @current=
+   1. Run the update
+   2. Run an =init.sh= to install everything
+
+If something goes wrong both =@base= and =@backup= should have EFIBootmgr entries so this will come at no cost to uptime.
+
+This workflow ensures the system is always in reproducable state and the the system is practically immutable, let's call it a static OS. This offers the advantages of an immutable distro with the flexibility to edit =/etc/resolv.conf=.
+
+To acheive this:
+
+#+begin_src bash
+snap() {
+    btrfs subvolume snapshot @    "@${1}"
+    btrfs subvolume snapshot @ -r "@${1}_ro"
+}
+for subv in base current backup; do
+    snap ${subv}
+done
+#+end_src
+
+Now we need to make the maintenance and current datasets bootable:
+
+
+#+begin_src bash
+make_efi_entry() {
+    root_par="root=LABEL=Butter"
+    luks_par="rd.luks.uuid=xxxxxxxx-xxxx"
+    subv_par="rootflags=subvol=${1}"
+
+    kern_par="rd.vconsole.keymaps=us ${luks_par} ${root_par} ${subv_par}"
+    unicode='initrd=\initramfs.img'"${kern_par}"
+
+    efibootmgr --verbose --create --disk "/dev/nvme0n1" --part "1" --label "gentoo (@${1})" --loader '\vmlinuz.efi' --unicode ${unicode}
+}
+
+for subv in base current backup; do
+    make_efi_entry ${subv}
+done
+#+end_src
+*** Notes on luks and LABEL vs UUID
+*** Static OS
+* ZFS Gentoo Static OS
+:PROPERTIES:
+:CUSTOM_ID: zfs-gentoo-static-os
+:END:
+This is a simpler problem than the btrfs one because it's not as simple
+to chroot into different subvolumes. I could snapshot base and then
+build a dataset off it and then modify the efibootmgr record, but it's a
+bit of a pain. Instead I'll have a script [fn:11] that:
+
+1. User Actions
+
+- Roll back to @base
+  - Or clone this system and call it current
+
+1. Assumes the system is on base
+2.
+3. Switches the system to
+
+** Warning
+:PROPERTIES:
+:CUSTOM_ID: warning
+:END:
+Don't use =zfs rename=, this (maybe) leaves a redirect behind, e.g.
+renaming =rpool/ROOT/default= to =rpool/ROOT/current-bak= means that
+booting will go for =current-bak=. It's hard to be certain, my install
+was by oddlama which sets the dataset to be called =rpool/ROOT/default=
+which usually boots by default. I'm not sure if a specific
+='root=ZFS=rpool/ROOT/dataset_name ... '= would lead to this behaviour.
+
+No, ZFS rename does not leave a redirect behind. The =zfs rename=
+command is meant to atomically change the name of the dataset. When you
+performed those commands, you essentially renamed 'rpool/ROOT/default'
+to 'rpool/ROOT/default-bak', and then 'rpool/ROOT/testing' to
+'rpool/ROOT/default'. The datasets have been renamed, but no forwarding
+or redirect occurs at the ZFS level.
+
+However, when dealing with ZFS datasets for system roots, the boot
+environment configuration may not be relying solely on the ZFS dataset's
+name. Modern operating systems generally use a bootloader that might
+have explicit references to the original dataset names and just renaming
+the datasets doesn't update these references. For example, the GRUB
+bootloader on systems using ZFS may have menu entries referring directly
+to dataset names.
+
+You can check once what is the current =bootfs= value with:
+
+#+begin_example
+zpool get bootfs rpool
+#+end_example
+
+#+begin_example
+NAME   PROPERTY  VALUE               SOURCE
+rpool  bootfs    rpool/ROOT/default  local
+#+end_example
+
+#+begin_example
+zfs rename rpool/ROOT/default rpool/ROOT/foo
+zpool get bootfs rpool
+#+end_example
+
+#+begin_example
+NAME   PROPERTY  VALUE           SOURCE
+rpool  bootfs    rpool/ROOT/foo  local
+#+end_example
+
+This shows that the bootfs is an integral property of the rpool, we may
+rely on it, but we don't need to. In the case of the void linux dataset,
+specifying the efibootmgr kernel parameter
+='root=ZFS=rpool/ROOT/void ...= was sufficient to boot that dataset. My
+perspective is that it's better to be explicit than rely on defaults,
+this way rename can be used to juggle datasets etc.
+
+Nonetheless, to update the =bootfs= property to the newly renamed
+'default' dataset, run:
+
+#+begin_example
+zpool set bootfs=rpool/ROOT/default rpool
+#+end_example
+
+** What I've done
+:PROPERTIES:
+:CUSTOM_ID: what-ive-done
+:END:
+snapshot, clone and promote default -> base moved the system extracted
+from tarball default->current-bak snapshot and clone base -> base@0 ->
+current mount current at /mnt/gentoo execute ./init.sh to build up base
+to the desired system snapshot and clone current -> current@0 -> default
+
+I don't love the names, but rather than re-configure =efibootmgr=, I'll
+do this on this ZFS install for now (later on likely will need
+=rpool/ROOT/gentoo/current= and =rpool/ROOT/void/current= etc. This will
+require reviewing EfiBootmgr though.
+
+1. =base=
+
+- A base install directly from oddlama with a few extra packages like
+  =fish= and =iwd=
+  - See my notes on oddlama install
+
+2. [@2] =current=
+
+- A built up daily driver
+
+3. [@3] =default=
+
+- What I'm running, this will be rolled back to current regularly
+  - Then couldn't I just use current and then call zfs rollback
+    periodically?
+
+Updates zfs rollback on current and then update that. periodically go
+back to base and then build that back up with all the packages.
+
+Maybe I should use zfs rollback with the snapshots and some how have two
+streams? well just take current and:
+
+- snapshot, clone, promote, destroy snap
+- zfs rollback current@base
+
+That gives you the backup which you can fall back to with =zfs rename=.
+This way rollbacks are quick and easy, simplifying this process.
+
+** Notes Footnotes
+:PROPERTIES:
+:CUSTOM_ID: notes-footnotes
+:END:
+*** Cloning ZFS Datasets
+:PROPERTIES:
+:CUSTOM_ID: cloning-zfs-datasets
+:END:
+1. *Create a Snapshot of the Original Dataset:* The first step is to
+   create a snapshot of the dataset you want to copy. Use the
+   =zfs snapshot= command for this.
+
+   #+begin_src sh
+   sudo zfs snapshot pool/originaldataset@snapshotname
+   #+end_src
+
+2. *Clone the Snapshot:* After snapshot creation, you'll need to clone
+   it. A clone is a writable copy of the snapshot.
+
+   #+begin_src sh
+   sudo zfs clone pool/originaldataset@snapshotname pool/cloneddataset
+   #+end_src
+
+3. *Mount the Cloned Dataset:* Typically, ZFS will automatically mount
+   the cloned dataset. Ensure it's mounted under a mount point where you
+   plan to perform the =chroot=. If you need to set a custom mount
+   point, you can do so with:
+
+   #+begin_src sh
+   sudo zfs set mountpoint=/custom/mountpoint pool/cloneddataset
+   #+end_src
+
+4. *Prepare the chroot environment:* Before chrooting, you might need to
+   copy the necessary system binaries, libraries, and other dependencies
+   that are required to run applications in the chroot environment.
+
+   Additionally, you might need to bind mount system directories like
+   =/dev=, =/proc=, and =/sys= into the chroot:
+
+   #+begin_src sh
+   sudo mount --rbind /dev /custom/mountpoint/dev
+   sudo mount --rbind /proc /custom/mountpoint/proc
+   sudo mount --rbind /sys /custom/mountpoint/sys
+   sudo mount -t tmpfs tmpfs /custom/mountpoint/run
+   #+end_src
+
+5. *Chroot into the Cloned Dataset:* Now you can =chroot= into the
+   cloned dataset:
+
+   #+begin_src sh
+   sudo chroot /custom/mountpoint
+   #+end_src
+
+*** Reverting to an Older Snapshot
+:PROPERTIES:
+:CUSTOM_ID: reverting-to-an-older-snapshot
+:END:
+**** Problem Statement
+:PROPERTIES:
+:CUSTOM_ID: problem-statement
+:END:
+If one uses =zfs rollback= all snapshots after that will also be
+destroyed. Instead one has to:
+
+1. Rename the dataset
+
+   #+begin_src sh
+   zfs rename rpool/ROOT/gentoo/current rpool/ROOT/current-bak
+   #+end_src
+
+2. Move the base dataset onto current
+
+   #+begin_src sh
+   zfs snapshot rpool/ROOT/gentoo/base@temp
+   zfs clone rpool/ROOT/gentoo/base@temp rpool/ROOT/gentoo/current
+   zfs promote rpool/ROOT/gentoo/current
+   zfs destroy rpool/ROOT/gentoo/base@temp
+   #+end_src
+
+3. Mount the new current
+
+   #+begin_src sh
+   zfs set mountpoint=/mnt rpool/ROOT/gentoo/current
+   zfs mount rpool/ROOT/gentoo/current
+   #+end_src
+
+4. Chroot in and install things
+
+   #+begin_src sh
+   # copy the gpt script
+   #+end_src
+
+5. Snapshot the current system as, e.g. =@current-bak=
+
+6. Clone the snapshot =@current-bas= as the dataset
+   =rpool/root/sys/current-bak=
+
+7. TODO can I then destroy =@current-bak=?
+
+8. rollback to =@base=
+
+9. Build the system up
+
+**** GPT Notes on doing this
+:PROPERTIES:
+:CUSTOM_ID: gpt-notes-on-doing-this
+:END:
+2. [@2] *Rename the current dataset:* Use the =zfs rename= command to
+   change the name of the current dataset. This will update its
+   mountpoint to reflect the new name as well.
+
+   #+begin_src sh
+   sudo zfs rename pool/originaldataset pool/dataset_old
+   #+end_src
+
+3. *Create a Snapshot:* Create a snapshot of the dataset you are
+   planning to clone. If you already have an existing snapshot you want
+   to use, you can skip this step.
+
+   #+begin_src sh
+   sudo zfs snapshot pool/dataset_old@snapshotname
+   #+end_src
+
+   Make sure you replace =pool=, =originaldataset=, =dataset_old=, and
+   =snapshotname= with the respective names relevant to your system.
+
+4. *Clone the Snapshot to the New Name:* Now clone the snapshot into the
+   desired new dataset name.
+
+   #+begin_src sh
+   sudo zfs clone pool/dataset_old@snapshotname pool/originaldataset
+   #+end_src
+
+After you perform these steps, the result will be:
+
+- The original dataset will have a new name (=dataset_old= in the
+  example).
+- The snapshot will remain in place as =pool/dataset_old@snapshotname=.
+- The newly cloned dataset will have the original name
+  (=originaldataset= in the example) and will essentially be a 'copy' of
+  the snapshot.
+
+Here's a simple visual:
+
+#+begin_example
+Old Name: pool/originaldataset  --renamed-->  pool/dataset_old
+                                                     |
+                                                     --snapshot-->  pool/dataset_old@snapshotname
+                                                                            |
+                                                                            --clone-->  pool/originaldataset (New clone with original name)
+#+end_example
+
+** The concept
+:PROPERTIES:
+:CUSTOM_ID: the-concept
+:END:
+*** ZFS
+:PROPERTIES:
+:CUSTOM_ID: zfs
+:END:
+**** Minor Update
+:PROPERTIES:
+:CUSTOM_ID: minor-update
+:END:
+1. Reset back to current the current snapshot
+   #+begin_src sh
+   zfs rollback rpool/ROOT/gentoo@current
+   #+end_src
+
+2. Update
+   #+begin_src sh
+   getbinpkg=n # set y for binaries, copile for -march=native
+   emerge --sync
+   emerge --sync torbrowser
+   emerge --getbinpkg=${getbinpkg} uND @world
+   #+end_src
+
+3. Snapshot the new update, this way =@current= remains an atomically
+   build environment
+   #+begin_src sh
+   zfs destroy  rpool/ROOT/gentoo@current
+   zfs snapshot rpool/ROOT/gentoo@current
+   #+end_src
+
+4. DONE, use the =rpool/ROOT/gentoo= dataset and occasionally rollback
+   to =@current= to ensure the system remains stable and reproducible
+
+**** New Packages
+:PROPERTIES:
+:CUSTOM_ID: new-packages
+:END:
+All dev packages should be managed with =Dockerfiles= and =podman=, this
+will ensure reproducible dev environments that are portable across
+systems.
+
+Although reproducible build environments could be acheived via this
+approach on gentoo/void/whatever, it is quicker to develop and debug
+Dockerfiles and they are portable (and can be shared). Configuring a dev
+environment on Gentoo that is reproducible will involve maintaining this
+script and then porting it to any other OS (e.g. Void/Fedora etc.),
+Dockerfiles can be shared between all OS.
+
+1. Copy =rpool/ROOT/gentoo@current= to =rpool/ROOT/gentoo/backup=
+   #+begin_example
+   # Clone the snap into a dataset
+   zfs clone rpool/ROOT/gentoo@current rpool/ROOT/gentoo/to-backup
+   # Copy the dataset (no dedupe, must be independent)
+   zfs send rpool/ROOT/gentoo/to-backup | zfs recv rpool/ROOT/gentoo/backup
+   # Remove the clone
+   zfs destroy rpool/ROOT/gentoo/to-backup
+   #+end_example
+
+2. Ensure that =rpool/ROOT/gentoo/backup= is bootable through
+   ZFSBootMenu or efibootmgr
+3. Rollback to base (be prepared to drop to TTY)
+   #+begin_example
+   zfs rollback rpool/ROOT/gentoo@base
+   #+end_example
+
+4. Update Base
+   #+begin_example
+   getbinpkg=n # set y for binaries, copile for -march=native
+   emerge --sync
+   emerge --sync torbrowser
+   emerge --getbinpkg=${getbinpkg} uND @world
+   #+end_example
+
+5. Tarball this base. This new base tarball can be distributed among
+   machines, so ensure =make.conf= is not =-march=native=
+   #+begin_src sh
+   # Create a clone to mount
+   ds=rpool/ROOT/gentoo/to-snap
+   dir=/tmp/gentoo/to-snap
+   zfs clone rpool/ROOT/gentoo@base ${ds}
+   zfs set mountpoint=legacy        ${ds}
+   mkdir -p           ${dir}
+   mount -t zfs ${ds} ${dir}
+   # Make the tarball
+   cd ${dir}
+   tar --acls --xattrs --preserve-permissions -cvaf root-backup-tar.gz .
+   # Remove the clone
+   cd / && umount ${dir}
+   zfs destroy ${ds}
+   #+end_src
+
+6. Snapshot this new base
+   #+begin_example
+   zfs destroy rpool/ROOT/gentoo@base
+   zfs snapshot rpool/ROOT/gentoo@base
+   #+end_example
+
+7. Edit the =make.conf= for something like:
+   #+begin_example
+   COMMON_FLAGS="-O2 -pipe -march=native"
+
+   FEATURES="${FEATURES} binpkg-request-signature"
+   FEATURES="${FEATURES} buildpkg"
+   MAKEOPTS="--jobs 16 --load 17"
+   EMERGE_DEFAULT_OPTS="--jobs 16"
+
+   # TODO
+   # GENTOO_MIRRORS
+   #+end_example
+
+8. Build the system using a reproducible script. There's no need to
+   =chroot= in as =zfs rollback= is live, the =backup= has already been
+   copied out.
+   #+begin_example
+   cd ~/Sync/Projects/2024/static-os/zfs-gentoo/
+   doas init.sh
+   #+end_example
+
+9. Snapshot as =@current= (that script should have done it)
+   #+begin_example
+   doas zfs snapshot rpool/ROOT/gentoo@current
+   #+end_example
+
+10. Done. =@base= is now an up to date base image with a tarball and
+    =@current= is a reproducible build from =@base= to a desired system.
+    Perform =zfs rollback rpool/ROOT/gentoo@current= to ensure the
+    system doesn't diverge from this desired state in order to enforce
+    reproducibility and stability
+
+- This was born out of an awful experience debugging a broken package
+  conflict and separately a broken podman install. Ensuring that the
+  system can be reproducibly built allows for a meaningful attempt at
+  debugging. Trying to figure out what changes, over 18 months of use,
+  contributed to a broken =podman= or package conflict is a lost cause.
+  This ensures the system is always in a state that can be understood
+  and debugged
+
+* Footnotes
+[fn:6] Note that it doesn't make sense to use label for luks, the UUID won't change unless you recreate the encryption volume and the encryption volume is block-based not file-based, it's not likely that the contents will be moved to a new file system in a way that would work, i.e. the UUID won't change. Unlike a root file system that can be tarballed and moved between machines.
+
+[fn:5] this is an advantage to ZFS where there is no mention of the zfs dataset in the fstab and it is inherited from the kernel parameter at boot
+[fn:4] [[https://github.com/dracutdevs/dracut/blob/master/man/dracut.cmdline.7.asc]]
+
+[fn:3] [[https://unix.stackexchange.com/questions/291638/mount-root-filesystem-from-initramfs][boot - Mount root filesystem from initramfs - Unix & Linux Stack Exchange]]
+[fn:2] [[https://wiki.archlinux.org/title/dm-crypt/System_configuration][dm-crypt/System configuration - ArchWiki]]
+
+[fn:1] Using =@= is convention is far less confusing and makes integration with snapper and timeshift simpler
+
+[fn:11] ./build_current.sh
