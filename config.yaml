@@ -12,6 +12,10 @@ meta:
   date_created: 2024-07-07
   date_modified: 2024-07-07
 
+containers:
+  - "Sync-Current-rsync/Applications/Containers/user/vidar/webdav"
+  - "Sync-Current-rsync/Applications/Containers/user/share/ollama"
+  - "Sync-Current-rsync/Applications/Containers/user/share/quartz2"
 packages:
     # System
   - app-admin/doas

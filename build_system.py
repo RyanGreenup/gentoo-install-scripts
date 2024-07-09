@@ -231,15 +231,23 @@ def configure_nvidia():
 def set_display_manager():
     dm_conf = "/etc/conf.d/display-manager"
     dm = config["dm"]
-    run(["cp", dm_conf, f"{dm_conf}.bak"])
-    # Replace the current display manager with gdm
-    with open(dm_conf, "r") as f:
-        lines = f.readlines()
-    for i, line in enumerate(lines):
-        if "DISPLAYMANAGER=" in line:
-            lines[i] = f'DISPLAYMANAGER="{dm}"'
+
+    # Modify the lines in the file
+    if os.path.exists(dm_conf):
+        run(["cp", dm_conf, f"{dm_conf}.bak"])
+        # Replace the current display manager with gdm
+        with open(dm_conf, "r") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if "DISPLAYMANAGER=" in line:
+                lines[i] = f'DISPLAYMANAGER="{dm}"'
+    else:
+        lines = ['DISPLAYMANAGER="gdm"']
+
+    # Write the lines to the config
     with open(dm_conf, "w") as f:
         f.writelines(lines)
+
     enable("elogind", "boot")
     enable("display-manager", "default")
 
@@ -247,6 +255,18 @@ def set_display_manager():
 def configure_docker():
     run(["usermod", "-aG", "docker", config["user"]])
     enable("docker", "default")
+
+    # Mount Home and start any needed containers (so they're there next boot)
+    run(["mount", "LABEL=Butter", "-o", "subvol=@home", "/home"])
+
+    home = f"/home/{config['user']}"
+    for c in config['containers']:
+        try:
+            run(
+                ["docker", "compose", "f", f"{home}/{c}/docker-compose.yml", "up", "-d"]
+            )
+        except Exception:
+            pass
 
 
 def get_installed_packages() -> list[str]:
